@@ -1,0 +1,45 @@
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+.flattened-pom.xml
+.m2/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+*.iws
+*.ipr
+
+# Build
+*.class
+*.jar
+*.war
+*.ear
+
+# Gradle (if used)
+.gradle/
+build/
+
+# Node (if used)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IntelliJ
+.idea/
+*.iml
+out/

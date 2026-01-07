@@ -1,6 +1,8 @@
 {
   "name": "Budget Tracker (Java + PostgreSQL)",
-  "dockerComposeFile": "docker-compose.yml",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
   "service": "app",
   "workspaceFolder": "/workspaces/personal-budget-tracker-630",
 

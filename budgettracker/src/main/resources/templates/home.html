@@ -13,6 +13,11 @@
         <header class="py-8 text-center mb-8">
             <h1 class="text-3xl font-extrabold text-indigo-400 mb-2 tracking-tight">BudgetTracker</h1>
             <p class="text-gray-400 text-base">Your personal budget dashboard</p>
+            <div class="absolute top-4 right-4">
+                <form th:action="@{/logout}" method="post">
+                    <button type="submit" class="px-4 py-2 bg-red-600 text-white rounded-lg font-semibold hover:bg-red-700 transition text-sm">Logout</button>
+                </form>
+            </div>
         </header>
         <!-- Summary Cards -->
         <div class="grid grid-cols-1 md:grid-cols-5 gap-6 mb-10">

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Budget Tracker - Welcome</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col justify-center items-center">
+    <div class="text-center max-w-2xl px-4">
+        <h1 class="text-5xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-purple-600 mb-6">
+            Master Your Money
+        </h1>
+        <p class="text-xl text-gray-400 mb-10">
+            Track expenses, visualize your spending patterns, and save for what matters most. Simple, secure, and free.
+        </p>
+        <div class="flex flex-col sm:flex-row justify-center gap-4">
+            <a th:href="@{/login}" class="px-8 py-3 bg-indigo-600 text-white rounded-lg font-bold hover:bg-indigo-700 transition transform hover:-translate-y-1 shadow-lg">
+                Login
+            </a>
+            <a th:href="@{/registration}" class="px-8 py-3 bg-gray-800 text-indigo-400 border border-indigo-600 rounded-lg font-bold hover:bg-gray-700 transition transform hover:-translate-y-1">
+                Join Now
+            </a>
+        </div>
+    </div>
+</body>
+</html>

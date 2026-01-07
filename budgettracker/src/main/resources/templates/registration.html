@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <title>Registration</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+</head>
+<body class="bg-gray-900 text-gray-100 flex items-center justify-center min-h-screen">
+    <div class="w-full max-w-md">
+        <form method="post" th:action="@{/registration}" th:object="${userForm}" class="bg-gray-800 shadow-md rounded-xl px-8 pt-6 pb-8 mb-4">
+            <h2 class="text-2xl font-bold text-center text-indigo-400 mb-6">Create Account</h2>
+            <div class="mb-4">
+                <label class="block text-gray-400 text-sm font-bold mb-2" for="username">
+                    Username
+                </label>
+                <input class="shadow appearance-none border rounded w-full py-2 px-3 bg-gray-900 text-gray-100 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500" id="username" type="text" th:field="*{username}" autofocus="autofocus">
+                <p th:if="${#fields.hasErrors('username')}" th:errors="*{username}" class="text-red-500 text-xs italic"></p>
+            </div>
+            <div class="mb-4">
+                <label class="block text-gray-400 text-sm font-bold mb-2" for="password">
+                    Password
+                </label>
+                <input class="shadow appearance-none border rounded w-full py-2 px-3 bg-gray-900 text-gray-100 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500" id="password" type="password" th:field="*{password}">
+                <p th:if="${#fields.hasErrors('password')}" th:errors="*{password}" class="text-red-500 text-xs italic"></p>
+            </div>
+            <div class="mb-6">
+                <label class="block text-gray-400 text-sm font-bold mb-2" for="passwordConfirm">
+                    Confirm Password
+                </label>
+                <input class="shadow appearance-none border rounded w-full py-2 px-3 bg-gray-900 text-gray-100 mb-3 leading-tight focus:outline-none focus:ring-2 focus:ring-indigo-500" id="passwordConfirm" type="password" th:field="*{passwordConfirm}">
+                <p th:if="${#fields.hasErrors('passwordConfirm')}" th:errors="*{passwordConfirm}" class="text-red-500 text-xs italic"></p>
+            </div>
+            <div class="flex items-center justify-between">
+                <button class="bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline" type="submit">
+                    Register
+                </button>
+                <a class="inline-block align-baseline font-bold text-sm text-indigo-400 hover:text-indigo-300" href="/login">
+                    Already have an account?
+                </a>
+            </div>
+        </form>
+    </div>
+</body>
+</html>

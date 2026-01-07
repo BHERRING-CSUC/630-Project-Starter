@@ -1,5 +1,10 @@
 package com.sarasitha.budgettracker.controller;
 
+import com.sarasitha.budgettracker.model.User;
+import com.sarasitha.budgettracker.service.UserService;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.authentication.AnonymousAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
 import com.sarasitha.budgettracker.model.Transaction;
 import com.sarasitha.budgettracker.model.Category;
 import com.sarasitha.budgettracker.repository.TransactionRepository;
@@ -32,15 +37,30 @@ public class TransactionController {
     @Autowired
     private IncomeRepository incomeRepository;
 
+    @Autowired
+    private UserService userService;
+
+    private User getLoggedInUser() {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        String currentPrincipalName = authentication.getName();
+        return userService.findByUsername(currentPrincipalName);
+    }
+
     @GetMapping("/")
     public String home(Model model) {
-        List<Transaction> transactions = transactionRepository.findAll();
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        if (authentication == null || authentication instanceof AnonymousAuthenticationToken) {
+            return "landing";
+        }
+
+        User user = getLoggedInUser();
+        List<Transaction> transactions = transactionRepository.findByUserId(user.getId());
         YearMonth currentMonth = YearMonth.now();
         double monthlyTotal = transactions.stream()
                 .filter(t -> t.getDate() != null && YearMonth.from(t.getDate()).equals(currentMonth))
                 .mapToDouble(Transaction::getAmount)
                 .sum();
-        List<Income> incomes = incomeRepository.findAll();
+        List<Income> incomes = incomeRepository.findByUserId(user.getId());
         double totalEarnings = incomes.stream()
                 .filter(i -> i.getDate() != null && YearMonth.from(i.getDate()).equals(currentMonth))
                 .mapToDouble(Income::getAmount)
@@ -78,13 +98,17 @@ public class TransactionController {
         if (transaction.getDate() == null) {
             transaction.setDate(LocalDate.now());
         }
+        transaction.setUser(getLoggedInUser());
         transactionRepository.save(transaction);
         return "redirect:/";
     }
 
     @GetMapping("/delete/{id}")
     public String deleteTransaction(@PathVariable Long id) {
-        transactionRepository.deleteById(id);
+        Transaction t = transactionRepository.findById(id).orElse(null);
+        if (t != null && t.getUser().getId().equals(getLoggedInUser().getId())) {
+             transactionRepository.deleteById(id);
+        }
         return "redirect:/";
     }
 
@@ -92,7 +116,8 @@ public class TransactionController {
     public void exportToCSV(HttpServletResponse response) throws IOException {
         response.setContentType("text/csv");
         response.setHeader("Content-Disposition", "attachment; filename=transactions.csv");
-        List<Transaction> transactions = transactionRepository.findAll();
+        User user = getLoggedInUser();
+        List<Transaction> transactions = transactionRepository.findByUserId(user.getId());
         try (PrintWriter writer = response.getWriter()) {
             writer.println("Title,Amount,Date,Category,Description");
             for (Transaction t : transactions) {
@@ -111,19 +136,21 @@ public class TransactionController {
         if (income.getDate() == null) {
             income.setDate(LocalDate.now());
         }
+        income.setUser(getLoggedInUser());
         incomeRepository.save(income);
         return "redirect:/";
     }
 
     @GetMapping("/dashboard")
     public String dashboard(Model model) {
-        List<Transaction> transactions = transactionRepository.findAll();
+        User user = getLoggedInUser();
+        List<Transaction> transactions = transactionRepository.findByUserId(user.getId());
         YearMonth currentMonth = YearMonth.now();
         double monthlyTotal = transactions.stream()
                 .filter(t -> t.getDate() != null && YearMonth.from(t.getDate()).equals(currentMonth))
                 .mapToDouble(Transaction::getAmount)
                 .sum();
-        List<Income> incomes = incomeRepository.findAll();
+        List<Income> incomes = incomeRepository.findByUserId(user.getId());
         double totalEarnings = incomes.stream()
                 .filter(i -> i.getDate() != null && YearMonth.from(i.getDate()).equals(currentMonth))
                 .mapToDouble(Income::getAmount)
@@ -136,17 +163,21 @@ public class TransactionController {
         return "dashboard";
     }
 
+
     @GetMapping("/transaction/{id}")
     @ResponseBody
     public ResponseEntity<Transaction> getTransaction(@PathVariable Long id) {
         return transactionRepository.findById(id)
+                .filter(t -> t.getUser().getId().equals(getLoggedInUser().getId()))
                 .map(ResponseEntity::ok)
                 .orElse(ResponseEntity.notFound().build());
     }
 
     @PostMapping("/transaction/edit")
     public String editTransaction(@ModelAttribute Transaction transaction) {
-        if (transaction.getId() != null && transactionRepository.existsById(transaction.getId())) {
+        Transaction existing = transactionRepository.findById(transaction.getId()).orElse(null);
+        if (existing != null && existing.getUser().getId().equals(getLoggedInUser().getId())) {
+            transaction.setUser(existing.getUser());
             transactionRepository.save(transaction);
         }
         return "redirect:/";
@@ -155,7 +186,8 @@ public class TransactionController {
     @PostMapping("/transaction/delete/{id}")
     @ResponseBody
     public ResponseEntity<?> deleteTransactionAjax(@PathVariable Long id) {
-        if (transactionRepository.existsById(id)) {
+        Transaction t = transactionRepository.findById(id).orElse(null);
+        if (t != null && t.getUser().getId().equals(getLoggedInUser().getId())) {
             transactionRepository.deleteById(id);
             return ResponseEntity.ok().build();
         } else {
@@ -167,13 +199,16 @@ public class TransactionController {
     @ResponseBody
     public ResponseEntity<Income> getIncome(@PathVariable Long id) {
         return incomeRepository.findById(id)
+                .filter(i -> i.getUser().getId().equals(getLoggedInUser().getId()))
                 .map(ResponseEntity::ok)
                 .orElse(ResponseEntity.notFound().build());
     }
 
     @PostMapping("/income/edit")
     public String editIncome(@ModelAttribute Income income) {
-        if (income.getId() != null && incomeRepository.existsById(income.getId())) {
+        Income existing = incomeRepository.findById(income.getId()).orElse(null);
+        if (existing != null && existing.getUser().getId().equals(getLoggedInUser().getId())) {
+            income.setUser(existing.getUser());
             incomeRepository.save(income);
         }
         return "redirect:/";
@@ -182,7 +217,8 @@ public class TransactionController {
     @PostMapping("/income/delete/{id}")
     @ResponseBody
     public ResponseEntity<?> deleteIncomeAjax(@PathVariable Long id) {
-        if (incomeRepository.existsById(id)) {
+        Income i = incomeRepository.findById(id).orElse(null);
+        if (i != null && i.getUser().getId().equals(getLoggedInUser().getId())) {
             incomeRepository.deleteById(id);
             return ResponseEntity.ok().build();
         } else {

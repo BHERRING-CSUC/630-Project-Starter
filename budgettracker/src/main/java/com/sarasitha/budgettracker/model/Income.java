@@ -13,6 +13,10 @@ public class Income {
     private LocalDate date;
     private String source;
 
+    @ManyToOne
+    @JoinColumn(name = "user_id")
+    private User user;
+
     public Income() {}
 
     public Long getId() { return id; }
@@ -29,4 +33,12 @@ public class Income {
 
     public String getSource() { return source; }
     public void setSource(String source) { this.source = source; }
+
+    public User getUser() {
+        return user;
+    }
+
+    public void setUser(User user) {
+        this.user = user;
+    }
 } 

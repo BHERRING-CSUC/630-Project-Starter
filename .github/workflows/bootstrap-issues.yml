@@ -26,11 +26,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Global-ish status holder (always initialized so -u won't blow up)
+          # Always initialized so `set -u` won't fail
           API_STATUS=""
 
+          # API helper: keeps API_STATUS in this shell (no subshell capture issues)
+          # Usage: api METHOD PATH DATA OUTVAR
           api() {
-            # Usage: api METHOD PATH [DATA] OUTVAR
             local method="$1"
             local path="$2"
             local data="${3:-}"
@@ -57,7 +58,6 @@ jobs:
                 "${url}")"
             fi
 
-            # Assign body to caller variable in THIS shell
             printf -v "${outvar}" '%s' "$(cat "${tmp}")"
             rm -f "${tmp}"
           }
@@ -66,7 +66,7 @@ jobs:
             python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
           }
 
-          # ----- Guard helpers -----
+          # ---------- Guard helpers (skip only if BOTH exist) ----------
 
           any_issues_exist() {
             local q encq resp total
@@ -75,8 +75,8 @@ jobs:
 
             api GET "/search/issues?q=${encq}&per_page=1" "" resp
             if [[ "${API_STATUS}" != "200" ]]; then
-              echo "ERROR: search/issues failed (HTTP ${API_STATUS})"
-              echo "${resp}"
+              echo "ERROR: search/issues failed (HTTP ${API_STATUS})" >&2
+              echo "${resp}" >&2
               exit 1
             fi
 
@@ -88,28 +88,20 @@ jobs:
             local resp
             api GET "/repos/${REPO}/milestones?state=all&per_page=1" "" resp
             if [[ "${API_STATUS}" != "200" ]]; then
-              echo "ERROR: milestones list failed (HTTP ${API_STATUS})"
-              echo "${resp}"
+              echo "ERROR: milestones list failed (HTTP ${API_STATUS})" >&2
+              echo "${resp}" >&2
               exit 1
             fi
             [[ "$(echo "${resp}" | jq 'length')" != "0" ]]
           }
 
-          # ----- Labels -----
-
-          label_exists() {
-            local name="$1"
-            local enc resp
-            enc="$(urlencode "$name")"
-            api GET "/repos/${REPO}/labels/${enc}" "" resp
-            [[ "${API_STATUS}" == "200" ]]
-          }
+          # ---------- Labels ----------
 
           ensure_label() {
             local name="$1"
             local color="$2"
             local desc="$3"
-            local enc resp payload patch
+            local enc payload patch resp
 
             enc="$(urlencode "$name")"
 
@@ -117,9 +109,8 @@ jobs:
               '{name:$name,color:$color,description:$description}')"
 
             api POST "/repos/${REPO}/labels" "${payload}" resp
-
             if [[ "${API_STATUS}" == "201" ]]; then
-              echo "Created label: ${name}"
+              echo "Created label: ${name}" >&2
               return 0
             fi
 
@@ -129,25 +120,25 @@ jobs:
 
               api PATCH "/repos/${REPO}/labels/${enc}" "${patch}" resp
               if [[ "${API_STATUS}" == "200" ]]; then
-                echo "Updated label: ${name}"
+                echo "Updated label: ${name}" >&2
                 return 0
               fi
             fi
 
-            echo "ERROR: ensure_label failed for ${name} (HTTP ${API_STATUS})"
-            echo "${resp}"
+            echo "ERROR: ensure_label failed for ${name} (HTTP ${API_STATUS})" >&2
+            echo "${resp}" >&2
             exit 1
           }
 
-          # ----- Milestones -----
+          # ---------- Milestones ----------
 
           milestone_number_by_title() {
             local title="$1"
             local resp num
             api GET "/repos/${REPO}/milestones?state=all&per_page=100" "" resp
             if [[ "${API_STATUS}" != "200" ]]; then
-              echo "ERROR: milestones list failed (HTTP ${API_STATUS})"
-              echo "${resp}"
+              echo "ERROR: milestones list failed (HTTP ${API_STATUS})" >&2
+              echo "${resp}" >&2
               exit 1
             fi
             num="$(echo "${resp}" | jq -r --arg t "${title}" '.[] | select(.title==$t) | .number' | head -n 1)"
@@ -172,8 +163,8 @@ jobs:
 
             api POST "/repos/${REPO}/milestones" "${payload}" resp
             if [[ "${API_STATUS}" != "201" ]]; then
-              echo "ERROR: create milestone failed for ${title} (HTTP ${API_STATUS})"
-              echo "${resp}"
+              echo "ERROR: create milestone failed for ${title} (HTTP ${API_STATUS})" >&2
+              echo "${resp}" >&2
               exit 1
             fi
 
@@ -182,7 +173,7 @@ jobs:
             echo "${num}"
           }
 
-          # ----- Issues -----
+          # ---------- Issues ----------
 
           issue_number_by_title_exact() {
             local title="$1"
@@ -192,11 +183,12 @@ jobs:
 
             api GET "/search/issues?q=${encq}&per_page=50" "" resp
             if [[ "${API_STATUS}" != "200" ]]; then
-              echo "ERROR: search/issues failed (HTTP ${API_STATUS})"
-              echo "${resp}"
+              echo "ERROR: search/issues failed (HTTP ${API_STATUS})" >&2
+              echo "${resp}" >&2
               exit 1
             fi
 
+            # exact title + not a PR
             num="$(echo "${resp}" | jq -r --arg t "${title}" '.items[] | select(.title==$t) | select(.pull_request==null) | .number' | head -n 1)"
             [[ "${num}" == "null" ]] && num=""
             echo "${num}"
@@ -211,7 +203,7 @@ jobs:
             existing_num="$(issue_number_by_title_exact "${title}")"
 
             if [[ -n "${existing_num}" ]]; then
-              echo "Skipping existing issue: ${title} (#${existing_num})"
+              echo "Skipping existing issue: ${title} (#${existing_num})" >&2
               echo "${existing_num}"
               return 0
             fi
@@ -230,13 +222,13 @@ jobs:
 
             api POST "/repos/${REPO}/issues" "${payload}" resp
             if [[ "${API_STATUS}" != "201" ]]; then
-              echo "ERROR: create_issue failed (HTTP ${API_STATUS}) for ${title}"
-              echo "${resp}"
+              echo "ERROR: create_issue failed (HTTP ${API_STATUS}) for ${title}" >&2
+              echo "${resp}" >&2
               exit 1
             fi
 
             num="$(echo "${resp}" | jq -r '.number')"
-            echo "Created issue: ${title} (#${num})"
+            echo "Created issue: ${title} (#${num})" >&2
             echo "${num}"
           }
 
@@ -244,12 +236,13 @@ jobs:
             local issue_number="$1"
             local milestone_number="$2"
             local payload resp
+
             payload="$(jq -n --argjson milestone "$milestone_number" '{milestone:$milestone}')"
 
             api PATCH "/repos/${REPO}/issues/${issue_number}" "${payload}" resp
             if [[ "${API_STATUS}" != "200" ]]; then
-              echo "ERROR: assign milestone failed for issue #${issue_number} (HTTP ${API_STATUS})"
-              echo "${resp}"
+              echo "ERROR: assign milestone failed for issue #${issue_number} (HTTP ${API_STATUS})" >&2
+              echo "${resp}" >&2
               exit 1
             fi
           }
@@ -275,22 +268,22 @@ jobs:
             ms="$(milestone_for_title "${title}")"
             if [[ -n "${ms}" ]]; then
               assign_issue_to_milestone "${num}" "${ms}"
-              echo "Assigned issue #${num} -> milestone #${ms}"
+              echo "Assigned issue #${num} -> milestone #${ms}" >&2
             fi
           }
 
-          echo "Repo: ${REPO}"
-          echo "Force: ${FORCE}"
+          echo "Repo: ${REPO}" >&2
+          echo "Force: ${FORCE}" >&2
 
           # Skip ONLY if BOTH issues exist AND milestones exist (unless forced).
           if [[ "${FORCE}" != "true" ]]; then
             if any_issues_exist && any_milestones_exist; then
-              echo "Repo already has issues AND milestones; skipping bootstrap."
+              echo "Repo already has issues AND milestones; skipping bootstrap." >&2
               exit 0
             fi
           fi
 
-          echo "Creating/updating labels..."
+          echo "Creating/updating labels..." >&2
           ensure_label "P1" "1f77b4" "Project 1"
           ensure_label "P2" "ff7f0e" "Project 2"
           ensure_label "P3" "2ca02c" "Project 3"
@@ -310,13 +303,15 @@ jobs:
           ensure_label "area/security" "b07aa1" "Security / auth"
           ensure_label "area/data" "9c755f" "Data model / DB"
 
-          echo "Creating/updating milestones..."
+          echo "Creating/updating milestones..." >&2
           MS_P1="$(ensure_milestone "P1" "Project 1: foundational tests + small refactors/bug fixes")"
           MS_P2="$(ensure_milestone "P2" "Project 2: maintainability rescue + larger refactoring")"
           MS_P3="$(ensure_milestone "P3" "Project 3: feature work with clean design + tests")"
           MS_P4="$(ensure_milestone "P4" "Project 4: DevOps/quality gates + release discipline")"
 
-          echo "Creating issues and assigning milestones..."
+          echo "Creating issues and assigning milestones..." >&2
+
+          # --- 30 issues ---
           create_and_assign "[P1][S] Fix \`/dashboard\` route (missing view)" "P1,size/S,type/bug,area/ui" $'Problem: Controller has `@GetMapping("/dashboard")` but no `dashboard.html` template.\n\nAcceptance criteria\n- Visiting `/dashboard` while logged in returns a valid page (either create `dashboard.html` or remove/redirect route).\n- Add at least one MVC test proving the behavior.\n\nNotes\n- If you keep it: reuse model attributes already computed in controller.'
           create_and_assign "[P1][S] Make static assets accessible on landing/login pages" "P1,size/S,type/bug,area/security" $'Problem: Security config permits `/css/**` and `/js/**`, but the repo uses `src/main/resources/static/style.css` (served at `/style.css`).\n\nAcceptance criteria\n- Landing + login pages load CSS without authentication.\n- Add a test (or document manual verification) showing unauthenticated access to the CSS path.\n\nHint\n- Update `requestMatchers(...)` to permit the actual static paths used.'
           create_and_assign "[P1][S] Sort transactions and incomes by date (newest first)" "P1,size/S,type/refactor" $'Acceptance criteria\n- Home page shows newest-first ordering for both transactions and incomes.\n- Use repository methods (e.g., `findByUserIdOrderByDateDesc`) instead of sorting in the view.\n- Add a unit test or repository test for ordering.'
@@ -351,4 +346,4 @@ jobs:
           create_and_assign "[P4][M] Add structured logging + request correlation IDs + troubleshooting guide" "P4,size/M,type/devops" $'Acceptance criteria\n- Every request has a correlation ID (filter/interceptor).\n- Logs include safe user identifier, route, and correlation ID.\n- Add TROUBLESHOOTING.md with “how to collect logs and reproduce.”'
           create_and_assign "[P4][M] Harden Actuator usage (health/info + security)" "P4,size/M,type/devops,area/security" $'Acceptance criteria\n- Configure Actuator endpoints (at least health, info) with appropriate exposure.\n- Ensure endpoints are protected (or intentionally exposed with reasoning).\n- Add a custom health indicator for DB connectivity (or verify built-in behavior) and test it.'
 
-          echo "Done."
+          echo "Done." >&2

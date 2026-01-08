@@ -1,0 +1,436 @@
+name: Bootstrap Labels + Issue Menu
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Re-run even if labels/issues already exist"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bootstrap labels and issues via GitHub REST API
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          FORCE: ${{ inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+
+          api() {
+            local method="$1"
+            local path="$2"
+            local data="${3:-}"
+            local url="https://api.github.com${path}"
+
+            if [[ -n "${data}" ]]; then
+              curl -sS -X "${method}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "${url}" \
+                -d "${data}"
+            else
+              curl -sS -X "${method}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "${url}"
+            fi
+          }
+
+          urlencode() {
+            python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+          }
+
+          label_exists() {
+            local name="$1"
+            local enc
+            enc="$(urlencode "$name")"
+            if api GET "/repos/${REPO}/labels/${enc}" >/dev/null 2>&1; then
+              return 0
+            fi
+            return 1
+          }
+
+          ensure_label() {
+            local name="$1"
+            local color="$2"
+            local desc="$3"
+            local enc
+            enc="$(urlencode "$name")"
+
+            # Try create; if it already exists, update it.
+            local payload
+            payload="$(jq -n --arg name "$name" --arg color "$color" --arg description "$desc" \
+              '{name:$name,color:$color,description:$description}')"
+
+            if api POST "/repos/${REPO}/labels" "${payload}" >/dev/null 2>&1; then
+              echo "Created label: ${name}"
+            else
+              local patch
+              patch="$(jq -n --arg new_name "$name" --arg color "$color" --arg description "$desc" \
+                '{new_name:$new_name,color:$color,description:$description}')"
+              api PATCH "/repos/${REPO}/labels/${enc}" "${patch}" >/dev/null
+              echo "Updated label: ${name}"
+            fi
+          }
+
+          issue_exists_by_title() {
+            local title="$1"
+            # Search issues in this repo by title (exact match check).
+            local q
+            q="repo:${REPO} in:title \"${title}\""
+            local encq
+            encq="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$q")"
+
+            local results
+            results="$(api GET "/search/issues?q=${encq}")"
+            echo "${results}" | jq -r '.items[].title' | grep -Fxq "${title}"
+          }
+
+          create_issue() {
+            local title="$1"
+            local labels_csv="$2"
+            local body="$3"
+
+            if issue_exists_by_title "${title}"; then
+              echo "Skipping existing issue: ${title}"
+              return 0
+            fi
+
+            # Convert CSV labels -> JSON array
+            local labels_json
+            labels_json="$(printf '%s' "${labels_csv}" \
+              | awk -F',' '{for (i=1;i<=NF;i++) print $i}' \
+              | sed '/^\s*$/d' \
+              | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+              | jq -R . | jq -s .)"
+
+            local payload
+            payload="$(jq -n \
+              --arg title "${title}" \
+              --arg body "${body}" \
+              --argjson labels "${labels_json}" \
+              '{title:$title, body:$body, labels:$labels}')"
+
+            api POST "/repos/${REPO}/issues" "${payload}" >/dev/null
+            echo "Created issue: ${title}"
+          }
+
+          echo "Repo: ${REPO}"
+
+          # Fast exit if already bootstrapped (unless forced)
+          if [[ "${FORCE}" != "true" ]]; then
+            if label_exists "P1"; then
+              echo "Looks already bootstrapped (label P1 exists). Re-run with workflow_dispatch force=true to force."
+              exit 0
+            fi
+          fi
+
+          echo "Creating labels..."
+          # Project phase labels
+          ensure_label "P1" "1f77b4" "Project 1"
+          ensure_label "P2" "ff7f0e" "Project 2"
+          ensure_label "P3" "2ca02c" "Project 3"
+          ensure_label "P4" "d62728" "Project 4"
+
+          # Size labels
+          ensure_label "size/S" "a1d99b" "Small scope"
+          ensure_label "size/M" "74c476" "Medium scope"
+          ensure_label "size/L" "238b45" "Large scope"
+
+          # Type labels
+          ensure_label "type/bug" "e15759" "Bug fix"
+          ensure_label "type/refactor" "4e79a7" "Refactoring / design cleanup"
+          ensure_label "type/feature" "59a14f" "New feature"
+          ensure_label "type/tests" "f28e2b" "Testing work"
+          ensure_label "type/devops" "edc949" "DevOps / CI / release"
+
+          # Area labels
+          ensure_label "area/ui" "76b7b2" "UI / UX"
+          ensure_label "area/security" "b07aa1" "Security / auth"
+          ensure_label "area/data" "9c755f" "Data model / DB"
+
+          echo "Creating issue menu..."
+
+          create_issue "[P1][S] Fix \`/dashboard\` route (missing view)" "P1,size/S,type/bug,area/ui" "$(cat <<'BODY'
+Problem: Controller has `@GetMapping("/dashboard")` but no `dashboard.html` template.
+
+Acceptance criteria
+- Visiting `/dashboard` while logged in returns a valid page (either create `dashboard.html` or remove/redirect route).
+- Add at least one MVC test proving the behavior.
+
+Notes
+- If you keep it: reuse model attributes already computed in controller.
+BODY
+)"
+
+          create_issue "[P1][S] Make static assets accessible on landing/login pages" "P1,size/S,type/bug,area/security" "$(cat <<'BODY'
+Problem: Security config permits `/css/**` and `/js/**`, but the repo uses `src/main/resources/static/style.css` (served at `/style.css`).
+
+Acceptance criteria
+- Landing + login pages load CSS without authentication.
+- Add a test (or document manual verification) showing unauthenticated access to the CSS path.
+
+Hint
+- Update `requestMatchers(...)` to permit the actual static paths used.
+BODY
+)"
+
+          create_issue "[P1][S] Sort transactions and incomes by date (newest first)" "P1,size/S,type/refactor" "$(cat <<'BODY'
+Acceptance criteria
+- Home page shows newest-first ordering for both transactions and incomes.
+- Use repository methods (e.g., `findByUserIdOrderByDateDesc`) instead of sorting in the view.
+- Add a unit test or repository test for ordering.
+BODY
+)"
+
+          create_issue "[P1][S] Add “empty state” UI for new users" "P1,size/S,type/feature,area/ui" "$(cat <<'BODY'
+Acceptance criteria
+- If there are no transactions/incomes, show friendly empty-state cards (“Add your first income/transaction”).
+- No broken charts (Chart.js should not throw on empty datasets).
+BODY
+)"
+
+          create_issue "[P1][M] Add bean validation to \`Transaction\` and \`Income\` + show errors in UI" "P1,size/M,type/feature,type/tests" "$(cat <<'BODY'
+Acceptance criteria
+- Add validation annotations (e.g., required title, amount > 0, date required).
+- Update controller methods to use `@Valid` + `BindingResult`.
+- UI displays field-level errors without losing entered form data.
+- Add tests for at least one invalid submission.
+BODY
+)"
+
+          create_issue "[P1][M] Add first meaningful tests for \`TransactionController#home\`" "P1,size/M,type/tests" "$(cat <<'BODY'
+Acceptance criteria
+- Add tests covering:
+  - anonymous user → returns `"landing"`
+  - authenticated user → returns `"home"` and includes expected model keys (transactions, incomeList, totals, chart data)
+- Use Spring Security test support to simulate auth.
+BODY
+)"
+
+          create_issue "[P1][M] Fix/clarify CSRF behavior for AJAX delete endpoints" "P1,size/M,type/bug,area/security,type/tests" "$(cat <<'BODY'
+Acceptance criteria
+- Deleting via `/transaction/delete/{id}` and `/income/delete/{id}` works reliably with Spring Security defaults.
+- Either:
+  - include CSRF token in fetch requests, OR
+  - explicitly configure CSRF (with justification in docs).
+- Add tests (preferred) or clear documentation explaining the choice.
+BODY
+)"
+
+          create_issue "[P1][M] Improve CSV export: consistent quoting + file name includes date" "P1,size/M,type/feature" "$(cat <<'BODY'
+Acceptance criteria
+- CSV export correctly handles commas/quotes/newlines in description/title.
+- Response header sets a filename like `transactions-YYYY-MM.csv`.
+- Add at least one test validating output format for “special character” input.
+BODY
+)"
+
+          create_issue "[P2][M] Introduce service layer for transactions/incomes (thin controllers)" "P2,size/M,type/refactor" "$(cat <<'BODY'
+Acceptance criteria
+- Create `TransactionService` and `IncomeService`.
+- Move “ownership checks” and CRUD logic out of controller.
+- Controller becomes request/response orchestration only.
+- Add unit tests for the services.
+BODY
+)"
+
+          create_issue "[P2][M] Deduplicate monthly summary calculations (home + dashboard)" "P2,size/M,type/refactor" "$(cat <<'BODY'
+Acceptance criteria
+- Create a `CashflowSummaryService` that computes:
+  - monthly spending total
+  - monthly income total
+  - net cashflow
+  - category totals for charts
+- Both `home()` and `dashboard()` use the service.
+- Add tests for edge cases (null dates, empty lists).
+BODY
+)"
+
+          create_issue "[P2][M] Replace “Month = now” with a \`PeriodStrategy\`" "P2,size/M,type/refactor,type/feature" "$(cat <<'BODY'
+Acceptance criteria
+- Add a clean way to compute summaries for different periods:
+  - current month (default)
+  - selected month via query param (e.g., `?month=2026-01`)
+- Use Strategy (or similar) rather than adding conditionals everywhere.
+- Tests cover at least 2 periods.
+BODY
+)"
+
+          create_issue "[P2][M] Add \`@ControllerAdvice\` for consistent error handling" "P2,size/M,type/refactor" "$(cat <<'BODY'
+Acceptance criteria
+- Centralize common errors (not found, validation, generic exception).
+- Return a friendly error view for HTML routes and sensible responses for JSON endpoints.
+- Add tests for one HTML error and one JSON error.
+BODY
+)"
+
+          create_issue "[P2][S] Make \`DataSeeder\` run only in dev profile" "P2,size/S,type/refactor" "$(cat <<'BODY'
+Acceptance criteria
+- DataSeeder does not run in tests or production-like runs.
+- Use `@Profile("dev")` or a config property.
+- Add a brief note in README: how to enable dev seeding.
+BODY
+)"
+
+          create_issue "[P2][M] Enforce unique usernames + improve registration validation" "P2,size/M,type/feature,area/security,type/tests" "$(cat <<'BODY'
+Acceptance criteria
+- Username uniqueness enforced at DB level and in validation (friendly message).
+- Registration fails gracefully if username is taken.
+- Tests cover duplicate registration attempt.
+BODY
+)"
+
+          create_issue "[P2][L] Replace \`double\` amounts with \`BigDecimal\` (money correctness)" "P2,size/L,type/refactor,type/tests,area/data" "$(cat <<'BODY'
+Acceptance criteria
+- Transaction.amount and Income.amount are BigDecimal.
+- All calculations updated (monthly totals, category totals, CSV export).
+- UI formatting updated (2 decimals).
+- Add tests showing rounding issues are gone.
+BODY
+)"
+
+          create_issue "[P2][L] Introduce a shared base entity for \`Income\` and \`Transaction\`" "P2,size/L,type/refactor" "$(cat <<'BODY'
+Acceptance criteria
+- Create a @MappedSuperclass (or composition) to reduce duplicated fields (amount/date/description/user).
+- Keep JPA mapping clean.
+- No behavior changes; tests still pass.
+- Add at least one test validating mappings still work.
+BODY
+)"
+
+          create_issue "[P3][M] Add filters: date range + category + text search" "P3,size/M,type/feature,area/ui" "$(cat <<'BODY'
+Acceptance criteria
+- Filter transactions by:
+  - start/end date
+  - category
+  - title/description contains
+- Filters apply to list + totals/charts (document the chosen behavior).
+- Tests for filter logic (service/repo level).
+BODY
+)"
+
+          create_issue "[P3][M] Add pagination for transactions and incomes" "P3,size/M,type/feature" "$(cat <<'BODY'
+Acceptance criteria
+- Use Spring Data Pageable for lists.
+- UI shows page controls and page size selection.
+- Tests cover page boundaries and sorting.
+BODY
+)"
+
+          create_issue "[P3][L] Implement monthly budgets per category" "P3,size/L,type/feature,area/data" "$(cat <<'BODY'
+Acceptance criteria
+- User can set a budget amount per category per month.
+- Dashboard shows remaining/over-budget per category.
+- Include data model changes + migrations approach documented.
+- Tests cover calculations and over-budget edge cases.
+BODY
+)"
+
+          create_issue "[P3][L] Recurring income/expense rules" "P3,size/L,type/feature,area/data" "$(cat <<'BODY'
+Acceptance criteria
+- User can create a recurrence rule (weekly/monthly) for income or transaction.
+- System generates instances up to a horizon (e.g., next 3 months) without duplicates.
+- Add tests for month-end edge cases (e.g., Jan 31).
+BODY
+)"
+
+          create_issue "[P3][L] CSV import with preview + validation report" "P3,size/L,type/feature,type/tests" "$(cat <<'BODY'
+Acceptance criteria
+- Upload CSV → show preview table → confirm import.
+- Validation errors reported per-row (missing date, bad amount, unknown category).
+- Tests cover importer parsing and validation.
+BODY
+)"
+
+          create_issue "[P3][L] Split a transaction across multiple categories" "P3,size/L,type/feature,area/data" "$(cat <<'BODY'
+Acceptance criteria
+- One purchase can be split into line items with categories/amounts.
+- Totals and category chart reflect split lines.
+- UI supports adding/removing split lines.
+- Tests cover invariants (sum of splits == transaction total).
+BODY
+)"
+
+          create_issue "[P3][M] Add “notes” field and display it everywhere relevant" "P3,size/M,type/feature" "$(cat <<'BODY'
+Acceptance criteria
+- Add notes to transaction and/or income.
+- Display notes in list/detail/edit and CSV export.
+- Migration plan documented.
+- Tests cover persistence and export.
+BODY
+)"
+
+          create_issue "[P3][M/L] Add a small REST API (read-only) for transactions + incomes" "P3,size/M,type/feature" "$(cat <<'BODY'
+Acceptance criteria
+- Endpoints:
+  - GET /api/transactions
+  - GET /api/incomes
+- Response includes only the logged-in user’s data.
+- Add at least one contract/integration test.
+Stretch: OpenAPI docs.
+BODY
+)"
+
+          create_issue "[P4][L] Introduce Flyway migrations and stop using \`ddl-auto=update\`" "P4,size/L,type/devops,area/data" "$(cat <<'BODY'
+Acceptance criteria
+- Add Flyway + baseline migration(s) matching current schema.
+- Set ddl-auto=validate (or none) for non-dev profiles.
+- App boots clean on an empty DB.
+- Document how to reset/recreate DB in dev.
+BODY
+)"
+
+          create_issue "[P4][M] Add Docker Compose for local run (app + Postgres) + docs" "P4,size/M,type/devops" "$(cat <<'BODY'
+Acceptance criteria
+- docker compose up brings up Postgres + app.
+- Uses environment variables (no secrets committed).
+- README includes one-command run instructions.
+BODY
+)"
+
+          create_issue "[P4][M] Add CI pipeline with required checks (tests + formatting)" "P4,size/M,type/devops,type/tests" "$(cat <<'BODY'
+Acceptance criteria
+- GitHub Actions runs mvn test on PR.
+- Add at least one quality gate: Spotless/formatter OR Checkstyle OR SpotBugs.
+- README: how to run the same checks locally.
+BODY
+)"
+
+          create_issue "[P4][M/L] Add Testcontainers-based integration tests for repositories" "P4,size/M,type/tests,type/devops" "$(cat <<'BODY'
+Acceptance criteria
+- Add integration tests that use Postgres Testcontainers for repositories and/or service layer.
+- CI runs them reliably.
+- Document expected runtime and how to run locally.
+BODY
+)"
+
+          create_issue "[P4][M] Add structured logging + request correlation IDs + troubleshooting guide" "P4,size/M,type/devops" "$(cat <<'BODY'
+Acceptance criteria
+- Every request has a correlation ID (filter/interceptor).
+- Logs include safe user identifier, route, and correlation ID.
+- Add TROUBLESHOOTING.md with “how to collect logs and reproduce.”
+BODY
+)"
+
+          create_issue "[P4][M] Harden Actuator usage (health/info + security)" "P4,size/M,type/devops,area/security" "$(cat <<'BODY'
+Acceptance criteria
+- Configure Actuator endpoints (at least health, info) with appropriate exposure.
+- Ensure endpoints are protected (or intentionally exposed with reasoning).
+- Add a custom health indicator for DB connectivity (or verify built-in behavior) and test it.
+BODY
+)"
+
+          echo "Done."

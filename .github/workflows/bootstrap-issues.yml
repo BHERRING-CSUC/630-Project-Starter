@@ -1,4 +1,4 @@
-name: Bootstrap Labels + Issue Menu
+name: Bootstrap Labels + Issue Menu + Milestones
 
 on:
   push:
@@ -18,7 +18,7 @@ jobs:
   bootstrap:
     runs-on: ubuntu-latest
     steps:
-      - name: Bootstrap labels and issues via GitHub REST API
+      - name: Bootstrap labels, milestones, and issues via GitHub REST API
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -97,35 +97,106 @@ jobs:
             fi
 
             echo "ERROR: ensure_label failed for ${name} (HTTP ${API_STATUS})"
-            api_json GET "/repos/${REPO}" >/dev/null || true
             exit 1
           }
 
-          issue_exists_by_title() {
+          milestone_number_by_title() {
             local title="$1"
-            local q
-            q="repo:${REPO} in:title \"${title}\""
+            local data
+            data="$(api_json GET "/repos/${REPO}/milestones?state=open&per_page=100")"
+            if [[ "${API_STATUS}" != "200" ]]; then
+              echo "ERROR: milestones list failed (HTTP ${API_STATUS})"
+              echo "${data}"
+              exit 1
+            fi
+            echo "${data}" | jq -r --arg t "${title}" '.[] | select(.title==$t) | .number' | head -n 1
+          }
+
+          ensure_milestone() {
+            local title="$1"
+            local description="$2"
+            local existing
+            existing="$(milestone_number_by_title "${title}")"
+
+            if [[ -n "${existing}" && "${existing}" != "null" ]]; then
+              echo "Milestone exists: ${title} (#${existing})" >&2
+              echo "${existing}"
+              return 0
+            fi
+
+            local payload
+            payload="$(jq -n --arg title "$title" --arg description "$description" \
+              '{title:$title, description:$description}')"
+
+            local resp
+            resp="$(api_json POST "/repos/${REPO}/milestones" "${payload}")"
+            if [[ "${API_STATUS}" != "201" ]]; then
+              echo "ERROR: create milestone failed for ${title} (HTTP ${API_STATUS})"
+              echo "${resp}"
+              exit 1
+            fi
+            local num
+            num="$(echo "${resp}" | jq -r '.number')"
+            echo "Created milestone: ${title} (#${num})" >&2
+            echo "${num}"
+          }
+
+          # Returns issue number if found by exact title; blank if not found.
+          issue_number_by_title_exact() {
+            local title="$1"
+            local q="repo:${REPO} is:issue in:title \"${title}\""
             local encq
             encq="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$q")"
 
             local results
-            results="$(api_json GET "/search/issues?q=${encq}")"
+            results="$(api_json GET "/search/issues?q=${encq}&per_page=50")"
             if [[ "${API_STATUS}" != "200" ]]; then
               echo "ERROR: search/issues failed (HTTP ${API_STATUS})"
               echo "${results}"
               exit 1
             fi
 
-            echo "${results}" | jq -r '.items[].title' | grep -Fxq "${title}"
+            # Extra safety: ensure it's not a PR and title is exact.
+            echo "${results}" | jq -r --arg t "${title}" '.items[] | select(.title==$t) | select(.pull_request==null) | .number' | head -n 1
           }
 
-          create_issue() {
+          assign_issue_to_milestone() {
+            local issue_number="$1"
+            local milestone_number="$2"
+            local payload
+            payload="$(jq -n --argjson milestone "$milestone_number" '{milestone:$milestone}')"
+
+            local resp
+            resp="$(api_json PATCH "/repos/${REPO}/issues/${issue_number}" "${payload}")"
+            if [[ "${API_STATUS}" != "200" ]]; then
+              echo "ERROR: assign milestone failed for issue #${issue_number} (HTTP ${API_STATUS})"
+              echo "${resp}"
+              exit 1
+            fi
+          }
+
+          milestone_for_title() {
+            local title="$1"
+            case "$title" in
+              "[P1]"*) echo "${MS_P1}" ;;
+              "[P2]"*) echo "${MS_P2}" ;;
+              "[P3]"*) echo "${MS_P3}" ;;
+              "[P4]"*) echo "${MS_P4}" ;;
+              *) echo "" ;;
+            esac
+          }
+
+          # Creates issue if missing; returns issue number (existing or newly created).
+          upsert_issue() {
             local title="$1"
             local labels_csv="$2"
             local body="$3"
 
-            if issue_exists_by_title "${title}"; then
-              echo "Skipping existing issue: ${title}"
+            local existing_num
+            existing_num="$(issue_number_by_title_exact "${title}")"
+            if [[ -n "${existing_num}" && "${existing_num}" != "null" ]]; then
+              echo "Skipping existing issue: ${title} (#${existing_num})"
+              echo "${existing_num}"
               return 0
             fi
 
@@ -143,14 +214,18 @@ jobs:
               --argjson labels "${labels_json}" \
               '{title:$title, body:$body, labels:$labels}')"
 
-            api_json POST "/repos/${REPO}/issues" "${payload}" >/dev/null
-            if [[ "${API_STATUS}" == "201" ]]; then
-              echo "Created issue: ${title}"
-              return 0
+            local resp
+            resp="$(api_json POST "/repos/${REPO}/issues" "${payload}")"
+            if [[ "${API_STATUS}" != "201" ]]; then
+              echo "ERROR: create_issue failed (HTTP ${API_STATUS}) for ${title}"
+              echo "${resp}"
+              exit 1
             fi
 
-            echo "ERROR: create_issue failed (HTTP ${API_STATUS}) for ${title}"
-            exit 1
+            local num
+            num="$(echo "${resp}" | jq -r '.number')"
+            echo "Created issue: ${title} (#${num})"
+            echo "${num}"
           }
 
           echo "Repo: ${REPO}"
@@ -158,7 +233,7 @@ jobs:
 
           if [[ "${FORCE}" != "true" ]]; then
             if label_exists "P1"; then
-              echo "Looks already bootstrapped (label P1 exists)."
+              echo "Looks already bootstrapped (label P1 exists). Exiting. (Run workflow with force=true to re-run.)"
               exit 0
             fi
           fi
@@ -183,11 +258,86 @@ jobs:
           ensure_label "area/security" "b07aa1" "Security / auth"
           ensure_label "area/data" "9c755f" "Data model / DB"
 
-          echo "Creating issue menu..."
-          create_issue "[P1][S] Fix \`/dashboard\` route (missing view)" "P1,size/S,type/bug,area/ui" "Problem: Controller has \`@GetMapping(\"/dashboard\")\` but no \`dashboard.html\` template.\n\nAcceptance criteria\n- Visiting \`/dashboard\` while logged in returns a valid page (either create \`dashboard.html\` or remove/redirect route).\n- Add at least one MVC test proving the behavior.\n\nNotes\n- If you keep it: reuse model attributes already computed in controller."
-          create_issue "[P1][S] Make static assets accessible on landing/login pages" "P1,size/S,type/bug,area/security" "Problem: Security config permits \`/css/**\` and \`/js/**\`, but the repo uses \`src/main/resources/static/style.css\` (served at \`/style.css\`).\n\nAcceptance criteria\n- Landing + login pages load CSS without authentication.\n- Add a test (or document manual verification) showing unauthenticated access to the CSS path.\n\nHint\n- Update \`requestMatchers(...)\` to permit the actual static paths used."
+          echo "Creating milestones..."
+          MS_P1="$(ensure_milestone "P1" "Project 1: foundational tests + small refactors/bug fixes")"
+          MS_P2="$(ensure_milestone "P2" "Project 2: maintainability rescue + larger refactoring")"
+          MS_P3="$(ensure_milestone "P3" "Project 3: feature work with clean design + tests")"
+          MS_P4="$(ensure_milestone "P4" "Project 4: DevOps/quality gates + release discipline")"
 
-          # NOTE: For brevity here, keep the rest of your 30 create_issue(...) calls exactly as before.
-          # Paste the remaining create_issue calls from your existing workflow beneath this point.
+          echo "Creating issues and assigning milestones..."
+
+          create_and_assign() {
+            local title="$1"
+            local labels="$2"
+            local body="$3"
+            local num
+            num="$(upsert_issue "${title}" "${labels}" "${body}")"
+            local ms
+            ms="$(milestone_for_title "${title}")"
+            if [[ -n "${ms}" ]]; then
+              assign_issue_to_milestone "${num}" "${ms}"
+              echo "Assigned issue #${num} -> milestone #${ms}"
+            fi
+          }
+
+          create_and_assign "[P1][S] Fix \`/dashboard\` route (missing view)" "P1,size/S,type/bug,area/ui" $'Problem: Controller has `@GetMapping("/dashboard")` but no `dashboard.html` template.\n\nAcceptance criteria\n- Visiting `/dashboard` while logged in returns a valid page (either create `dashboard.html` or remove/redirect route).\n- Add at least one MVC test proving the behavior.\n\nNotes\n- If you keep it: reuse model attributes already computed in controller.'
+
+          create_and_assign "[P1][S] Make static assets accessible on landing/login pages" "P1,size/S,type/bug,area/security" $'Problem: Security config permits `/css/**` and `/js/**`, but the repo uses `src/main/resources/static/style.css` (served at `/style.css`).\n\nAcceptance criteria\n- Landing + login pages load CSS without authentication.\n- Add a test (or document manual verification) showing unauthenticated access to the CSS path.\n\nHint\n- Update `requestMatchers(...)` to permit the actual static paths used.'
+
+          create_and_assign "[P1][S] Sort transactions and incomes by date (newest first)" "P1,size/S,type/refactor" $'Acceptance criteria\n- Home page shows newest-first ordering for both transactions and incomes.\n- Use repository methods (e.g., `findByUserIdOrderByDateDesc`) instead of sorting in the view.\n- Add a unit test or repository test for ordering.'
+
+          create_and_assign "[P1][S] Add “empty state” UI for new users" "P1,size/S,type/feature,area/ui" $'Acceptance criteria\n- If there are no transactions/incomes, show friendly empty-state cards (“Add your first income/transaction”).\n- No broken charts (Chart.js should not throw on empty datasets).'
+
+          create_and_assign "[P1][M] Add bean validation to \`Transaction\` and \`Income\` + show errors in UI" "P1,size/M,type/feature,type/tests" $'Acceptance criteria\n- Add validation annotations (e.g., required title, amount > 0, date required).\n- Update controller methods to use `@Valid` + `BindingResult`.\n- UI displays field-level errors without losing entered form data.\n- Add tests for at least one invalid submission.'
+
+          create_and_assign "[P1][M] Add first meaningful tests for \`TransactionController#home\`" "P1,size/M,type/tests" $'Acceptance criteria\n- Add tests covering:\n  - anonymous user → returns `"landing"`\n  - authenticated user → returns `"home"` and includes expected model keys (transactions, incomeList, totals, chart data)\n- Use Spring Security test support to simulate auth.'
+
+          create_and_assign "[P1][M] Fix/clarify CSRF behavior for AJAX delete endpoints" "P1,size/M,type/bug,area/security,type/tests" $'Acceptance criteria\n- Deleting via `/transaction/delete/{id}` and `/income/delete/{id}` works reliably with Spring Security defaults.\n- Either:\n  - include CSRF token in fetch requests, OR\n  - explicitly configure CSRF (with justification in docs).\n- Add tests (preferred) or clear documentation explaining the choice.'
+
+          create_and_assign "[P1][M] Improve CSV export: consistent quoting + file name includes date" "P1,size/M,type/feature" $'Acceptance criteria\n- CSV export correctly handles commas/quotes/newlines in description/title.\n- Response header sets a filename like `transactions-YYYY-MM.csv`.\n- Add at least one test validating output format for “special character” input.'
+
+          create_and_assign "[P2][M] Introduce service layer for transactions/incomes (thin controllers)" "P2,size/M,type/refactor" $'Acceptance criteria\n- Create `TransactionService` and `IncomeService`.\n- Move “ownership checks” and CRUD logic out of controller.\n- Controller becomes request/response orchestration only.\n- Add unit tests for the services.'
+
+          create_and_assign "[P2][M] Deduplicate monthly summary calculations (home + dashboard)" "P2,size/M,type/refactor" $'Acceptance criteria\n- Create a `CashflowSummaryService` that computes:\n  - monthly spending total\n  - monthly income total\n  - net cashflow\n  - category totals for charts\n- Both `home()` and `dashboard()` use the service.\n- Add tests for edge cases (null dates, empty lists).'
+
+          create_and_assign "[P2][M] Replace “Month = now” with a \`PeriodStrategy\`" "P2,size/M,type/refactor,type/feature" $'Acceptance criteria\n- Add a clean way to compute summaries for different periods:\n  - current month (default)\n  - selected month via query param (e.g., `?month=2026-01`)\n- Use Strategy (or similar) rather than adding conditionals everywhere.\n- Tests cover at least 2 periods.'
+
+          create_and_assign "[P2][M] Add \`@ControllerAdvice\` for consistent error handling" "P2,size/M,type/refactor" $'Acceptance criteria\n- Centralize common errors (not found, validation, generic exception).\n- Return a friendly error view for HTML routes and sensible responses for JSON endpoints.\n- Add tests for one HTML error and one JSON error.'
+
+          create_and_assign "[P2][S] Make \`DataSeeder\` run only in dev profile" "P2,size/S,type/refactor" $'Acceptance criteria\n- DataSeeder does not run in tests or production-like runs.\n- Use `@Profile("dev")` or a config property.\n- Add a brief note in README: how to enable dev seeding.'
+
+          create_and_assign "[P2][M] Enforce unique usernames + improve registration validation" "P2,size/M,type/feature,area/security,type/tests" $'Acceptance criteria\n- Username uniqueness enforced at DB level and in validation (friendly message).\n- Registration fails gracefully if username is taken.\n- Tests cover duplicate registration attempt.'
+
+          create_and_assign "[P2][L] Replace \`double\` amounts with \`BigDecimal\` (money correctness)" "P2,size/L,type/refactor,type/tests,area/data" $'Acceptance criteria\n- Transaction.amount and Income.amount are BigDecimal.\n- All calculations updated (monthly totals, category totals, CSV export).\n- UI formatting updated (2 decimals).\n- Add tests showing rounding issues are gone.'
+
+          create_and_assign "[P2][L] Introduce a shared base entity for \`Income\` and \`Transaction\`" "P2,size/L,type/refactor" $'Acceptance criteria\n- Create a @MappedSuperclass (or composition) to reduce duplicated fields (amount/date/description/user).\n- Keep JPA mapping clean.\n- No behavior changes; tests still pass.\n- Add at least one test validating mappings still work.'
+
+          create_and_assign "[P3][M] Add filters: date range + category + text search" "P3,size/M,type/feature,area/ui" $'Acceptance criteria\n- Filter transactions by:\n  - start/end date\n  - category\n  - title/description contains\n- Filters apply to list + totals/charts (document the chosen behavior).\n- Tests for filter logic (service/repo level).'
+
+          create_and_assign "[P3][M] Add pagination for transactions and incomes" "P3,size/M,type/feature" $'Acceptance criteria\n- Use Spring Data Pageable for lists.\n- UI shows page controls and page size selection.\n- Tests cover page boundaries and sorting.'
+
+          create_and_assign "[P3][L] Implement monthly budgets per category" "P3,size/L,type/feature,area/data" $'Acceptance criteria\n- User can set a budget amount per category per month.\n- Dashboard shows remaining/over-budget per category.\n- Include data model changes + migrations approach documented.\n- Tests cover calculations and over-budget edge cases.'
+
+          create_and_assign "[P3][L] Recurring income/expense rules" "P3,size/L,type/feature,area/data" $'Acceptance criteria\n- User can create a recurrence rule (weekly/monthly) for income or transaction.\n- System generates instances up to a horizon (e.g., next 3 months) without duplicates.\n- Add tests for month-end edge cases (e.g., Jan 31).'
+
+          create_and_assign "[P3][L] CSV import with preview + validation report" "P3,size/L,type/feature,type/tests" $'Acceptance criteria\n- Upload CSV → show preview table → confirm import.\n- Validation errors reported per-row (missing date, bad amount, unknown category).\n- Tests cover importer parsing and validation.'
+
+          create_and_assign "[P3][L] Split a transaction across multiple categories" "P3,size/L,type/feature,area/data" $'Acceptance criteria\n- One purchase can be split into line items with categories/amounts.\n- Totals and category chart reflect split lines.\n- UI supports adding/removing split lines.\n- Tests cover invariants (sum of splits == transaction total).'
+
+          create_and_assign "[P3][M] Add “notes” field and display it everywhere relevant" "P3,size/M,type/feature" $'Acceptance criteria\n- Add notes to transaction and/or income.\n- Display notes in list/detail/edit and CSV export.\n- Migration plan documented.\n- Tests cover persistence and export.'
+
+          create_and_assign "[P3][M/L] Add a small REST API (read-only) for transactions + incomes" "P3,size/M,type/feature" $'Acceptance criteria\n- Endpoints:\n  - GET /api/transactions\n  - GET /api/incomes\n- Response includes only the logged-in user’s data.\n- Add at least one contract/integration test.\nStretch: OpenAPI docs.'
+
+          create_and_assign "[P4][L] Introduce Flyway migrations and stop using \`ddl-auto=update\`" "P4,size/L,type/devops,area/data" $'Acceptance criteria\n- Add Flyway + baseline migration(s) matching current schema.\n- Set ddl-auto=validate (or none) for non-dev profiles.\n- App boots clean on an empty DB.\n- Document how to reset/recreate DB in dev.'
+
+          create_and_assign "[P4][M] Add Docker Compose for local run (app + Postgres) + docs" "P4,size/M,type/devops" $'Acceptance criteria\n- docker compose up brings up Postgres + app.\n- Uses environment variables (no secrets committed).\n- README includes one-command run instructions.'
+
+          create_and_assign "[P4][M] Add CI pipeline with required checks (tests + formatting)" "P4,size/M,type/devops,type/tests" $'Acceptance criteria\n- GitHub Actions runs mvn test on PR.\n- Add at least one quality gate: Spotless/formatter OR Checkstyle OR SpotBugs.\n- README: how to run the same checks locally.'
+
+          create_and_assign "[P4][M/L] Add Testcontainers-based integration tests for repositories" "P4,size/M,type/tests,type/devops" $'Acceptance criteria\n- Add integration tests that use Postgres Testcontainers for repositories and/or service layer.\n- CI runs them reliably.\n- Document expected runtime and how to run locally.'
+
+          create_and_assign "[P4][M] Add structured logging + request correlation IDs + troubleshooting guide" "P4,size/M,type/devops" $'Acceptance criteria\n- Every request has a correlation ID (filter/interceptor).\n- Logs include safe user identifier, route, and correlation ID.\n- Add TROUBLESHOOTING.md with “how to collect logs and reproduce.”'
+
+          create_and_assign "[P4][M] Harden Actuator usage (health/info + security)" "P4,size/M,type/devops,area/security" $'Acceptance criteria\n- Configure Actuator endpoints (at least health, info) with appropriate exposure.\n- Ensure endpoints are protected (or intentionally exposed with reasoning).\n- Add a custom health indicator for DB connectivity (or verify built-in behavior) and test it.'
 
           echo "Done."

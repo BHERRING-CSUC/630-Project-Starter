@@ -10,7 +10,7 @@ on:
         required: false
         default: "false"
       purge:
-        description: "Close ALL existing issues first (recommended to fix duplicates). NOTE: Issues cannot be deleted, only closed."
+        description: "Close ALL existing issues first (GitHub cannot delete issues; this closes them)."
         required: false
         default: "false"
 
@@ -69,7 +69,7 @@ jobs:
             python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
           }
 
-          # Skip ONLY if BOTH issues exist AND milestones exist (unless forced)
+          # Skip ONLY if BOTH issues exist AND milestones exist (unless forced/purge)
           any_issues_exist() {
             local q encq resp total
             q="repo:${REPO} is:issue"
@@ -180,7 +180,42 @@ jobs:
               | jq -R . | jq -s .
           }
 
-          # Exact-title lookup by listing issues (avoids Search indexing quirks)
+          # Close ALL issues (cannot delete). Skip PRs.
+          purge_all_issues_close_only() {
+            echo "PURGE enabled: closing ALL existing issues (PRs are skipped). GitHub does not support issue deletion." >&2
+            local page=1 resp
+
+            while true; do
+              api GET "/repos/${REPO}/issues?state=all&per_page=100&page=${page}" "" resp
+              if [[ "${API_STATUS}" != "200" ]]; then
+                echo "ERROR: list issues failed (HTTP ${API_STATUS})" >&2
+                echo "${resp}" >&2
+                exit 1
+              fi
+
+              if [[ "$(echo "${resp}" | jq 'length')" == "0" ]]; then
+                break
+              fi
+
+              echo "${resp}" | jq -r '.[] | select(.pull_request==null) | .number' \
+                | while read -r num; do
+                    local payload out
+                    payload="$(jq -n '{state:"closed", milestone:null, labels:[]}')"
+                    api PATCH "/repos/${REPO}/issues/${num}" "${payload}" out
+                    if [[ "${API_STATUS}" != "200" ]]; then
+                      echo "ERROR: failed to close issue #${num} (HTTP ${API_STATUS})" >&2
+                      echo "${out}" >&2
+                      exit 1
+                    fi
+                  done
+
+              page=$((page + 1))
+            done
+
+            echo "PURGE complete: all issues closed." >&2
+          }
+
+          # Exact-title lookup by listing issues (used only when NOT purging)
           issue_number_by_title_list() {
             local title="$1"
             local page=1 resp num
@@ -212,6 +247,34 @@ jobs:
             echo ""
           }
 
+          # Create a new issue ALWAYS (used when PURGE=true to avoid "updating" closed duplicates)
+          create_issue_always() {
+            local title="$1"
+            local labels_csv="$2"
+            local body="$3"
+            local labels_json payload resp num
+
+            labels_json="$(labels_csv_to_json "${labels_csv}")"
+
+            payload="$(jq -n \
+              --arg title "${title}" \
+              --arg body "${body}" \
+              --argjson labels "${labels_json}" \
+              '{title:$title, body:$body, labels:$labels}')"
+
+            api POST "/repos/${REPO}/issues" "${payload}" resp
+            if [[ "${API_STATUS}" != "201" ]]; then
+              echo "ERROR: create issue failed (HTTP ${API_STATUS}) for ${title}" >&2
+              echo "${resp}" >&2
+              exit 1
+            fi
+
+            num="$(echo "${resp}" | jq -r '.number')"
+            echo "Created issue: ${title} (#${num})" >&2
+            echo "${num}"
+          }
+
+          # Upsert behavior when NOT purging (update existing by title, else create)
           ensure_issue() {
             local title="$1"
             local labels_csv="$2"
@@ -300,70 +363,36 @@ jobs:
 
                     if [[ -n "${ms}" ]]; then
                       assign_issue_to_milestone "${num}" "${ms}"
-                      echo "Assigned issue #${num} -> milestone #${ms} (${title})" >&2
                     fi
                   done
 
               page=$((page + 1))
             done
-          }
-
-          # ===== NEW: "Delete" all issues (actually CLOSE them; GitHub does not support hard-delete) =====
-          purge_all_issues_close_only() {
-            echo "PURGE enabled: closing ALL existing issues (PRs will be skipped)." >&2
-
-            local page=1
-            while true; do
-              local resp
-              api GET "/repos/${REPO}/issues?state=all&per_page=100&page=${page}" "" resp
-              if [[ "${API_STATUS}" != "200" ]]; then
-                echo "ERROR: list issues failed (HTTP ${API_STATUS})" >&2
-                echo "${resp}" >&2
-                exit 1
-              fi
-
-              if [[ "$(echo "${resp}" | jq 'length')" == "0" ]]; then
-                break
-              fi
-
-              echo "${resp}" | jq -r '.[] | select(.pull_request==null) | "\(.number)"' \
-                | while read -r num; do
-                    # Close and clear milestone + labels so they don't clutter milestones/views
-                    local payload out
-                    payload="$(jq -n '{state:"closed", milestone:null, labels:[]}')"
-                    api PATCH "/repos/${REPO}/issues/${num}" "${payload}" out
-                    if [[ "${API_STATUS}" != "200" ]]; then
-                      echo "ERROR: failed to close issue #${num} (HTTP ${API_STATUS})" >&2
-                      echo "${out}" >&2
-                      exit 1
-                    fi
-                    echo "Closed issue #${num}" >&2
-                  done
-
-              page=$((page + 1))
-            done
-
-            echo "PURGE complete: all issues closed." >&2
           }
 
           # Append test-type definitions to EVERY issue so contexts are unambiguous.
-          TEST_TYPES=$'---\n### Test type definitions (CSCI 630 standard)\n- **MVC test (Controller slice):** `@WebMvcTest(Controller.class)` + `MockMvc` + `spring-security-test`. No real DB. Mock dependencies using `@MockBean`/`@MockitoBean`. Assert: HTTP status + view name (or JSON) + key model attributes + security (anonymous vs `@WithMockUser`) + CSRF where relevant.\n- **Service unit test:** Plain JUnit5 + Mockito (`@ExtendWith(MockitoExtension.class)`). No Spring context. Assert business rules, ownership checks, and repository interactions.\n- **Repository test (JPA slice):** `@DataJpaTest`. Uses an embedded test DB (course standard: H2 as **test** dependency) unless issue requires Testcontainers.\n- **Integration test (full stack):** `@SpringBootTest` + `@AutoConfigureMockMvc`. Hits real web + services + repositories. Uses embedded DB (H2) unless issue requires Postgres Testcontainers.\n'
+          TEST_TYPES=$'---\n### Test type definitions (CSCI 630 standard)\n- **MVC test (Controller slice):** `@WebMvcTest(Controller.class)` + `MockMvc` + `spring-security-test`. No real DB. Mock dependencies using `@MockBean`. Assert: HTTP status + view name (or JSON) + key model attributes + security (anonymous vs `@WithMockUser`) + CSRF where relevant.\n- **Service unit test:** Plain JUnit5 + Mockito (`@ExtendWith(MockitoExtension.class)`). No Spring context. Assert business rules, ownership checks, and repository interactions.\n- **Repository test (JPA slice):** `@DataJpaTest`. Uses an embedded test DB. Assert query correctness (ordering, scoping by user, uniqueness constraints).\n- **Integration test (full stack):** `@SpringBootTest` + `@AutoConfigureMockMvc`. Hits real web + services + repositories. Uses embedded DB (H2) unless explicitly requiring Postgres/Testcontainers.\n'
 
           create_and_assign() {
             local title="$1"
             local labels="$2"
             local body="$3"
-            local full_body
+            local full_body num
             full_body="${body}"$'\n\n'"${TEST_TYPES}"
-            ensure_issue "${title}" "${labels}" "${full_body}" >/dev/null
-            echo "Ensured issue: ${title}" >&2
+
+            if [[ "${PURGE}" == "true" ]]; then
+              num="$(create_issue_always "${title}" "${labels}" "${full_body}")"
+            else
+              num="$(ensure_issue "${title}" "${labels}" "${full_body}")"
+            fi
+
+            echo "Ensured issue: ${title} (#${num})" >&2
           }
 
           echo "Repo: ${REPO}" >&2
           echo "Force: ${FORCE}" >&2
           echo "Purge: ${PURGE}" >&2
 
-          # Safety: only purge when explicitly requested
           if [[ "${PURGE}" == "true" ]]; then
             purge_all_issues_close_only
           fi
@@ -390,49 +419,93 @@ jobs:
           ensure_label "type/feature" "59a14f" "New feature"
           ensure_label "type/tests" "f28e2b" "Testing work"
           ensure_label "type/devops" "edc949" "DevOps / CI / release"
+          ensure_label "type/docs" "9edae5" "Documentation / reporting"
 
           ensure_label "area/ui" "76b7b2" "UI / UX"
           ensure_label "area/security" "b07aa1" "Security / auth"
           ensure_label "area/data" "9c755f" "Data model / DB"
+          ensure_label "area/ops" "bab0ac" "Operations / reliability"
 
           ensure_label "anchor/patterns" "9467bd" "Requires an explicit design pattern application"
           ensure_label "anchor/smells-antipatterns" "8c564b" "Requires identifying and correcting a code smell or anti-pattern"
 
           echo "Creating/updating milestones in reverse creation order (P4 -> P1)..." >&2
-          MS_P4="$(ensure_milestone "P4" "Project 4: quality gates + wrap-up report")"
-          MS_P3="$(ensure_milestone "P3" "Project 3: feature work with clean design + tests")"
-          MS_P2="$(ensure_milestone "P2" "Project 2: maintainability rescue + refactoring")"
-          MS_P1="$(ensure_milestone "P1" "Project 1: foundational tests + targeted fixes")"
+          MS_P4="$(ensure_milestone "P4" "Project 4 (lighter): Release readiness + quality gate + reporting (Week 13 prep, Weeks 14–15 build, Week 16 wrap-up)")"
+          MS_P3="$(ensure_milestone "P3" "Project 3 (narrowed): Feature delivery using Specifications/Query Object for filtering + clean boundaries + tests")"
+          MS_P2="$(ensure_milestone "P2" "Project 2: Maintainability rescue via intentional refactoring (smells -> patterns) + unit tests")"
+          MS_P1="$(ensure_milestone "P1" "Project 1: Baseline safety net (MVC tests + targeted fixes) + first smell->pattern design note")"
 
           echo "Ensuring issues in reverse creation order (P4 -> P1)..." >&2
 
           # =========================
-          # P4 (lighter / wrap-up oriented)
+          # P4 (LIGHTER + REPORTING-HEAVY)
           # =========================
-          create_and_assign "[P4][M] Add CI pipeline with required checks (tests + formatting)" "P4,size/M,type/devops,type/tests" $'## Goal\nMake quality enforceable by CI.\n\n## Required work\n1) Add a GitHub Actions workflow that runs on PR.\n2) Workflow must include:\n   - `unit-tests`: runs `./test.sh`\n   - `quality-gate`: runs ONE of Spotless OR Checkstyle OR SpotBugs\n\n## Acceptance criteria\n- CI runs on PR.\n- Both jobs appear as checks and fail when appropriate.\n- README documents how to run checks locally.\n'
 
-          create_and_assign "[P4][M] Course wrap-up report: maintainability improvements over the term" "P4,size/M,type/feature" $'## Goal\nWrite the “maintenance story” of your repo.\n\n## Required work\nCreate `docs/P4-WRAPUP-REPORT.md` with sections:\n1) **Before/After summary** (what was hardest initially; what is easier now)\n2) **Evidence table** (at minimum):\n   - total tests added (by type)\n   - # PRs merged\n   - key smells removed + patterns applied (named)\n3) **Top 3 improvements** (each: link to PR, what changed, why it matters)\n4) **Remaining technical debt** (what you would do next)\n\n## Acceptance criteria\n- Report is complete and references real PRs/issues.\n- Uses named smells/anti-patterns and named patterns.\n'
+          create_and_assign "[P4][M] Final Maintenance Story Report (semester summary)" "P4,size/M,type/docs,area/ops" $'## Goal\nWrite a clear evidence-based narrative of what you improved across the entire semester.\n\n## Required report\nCreate `docs/P4-MAINTENANCE-STORY.md` with these exact sections:\n1) **Baseline (Week 1 state)**\n   - What was scary / brittle / unclear?\n2) **Safety Net (tests)**\n   - List total tests added across the term (rough count)\n   - Link to 3 representative PRs that added meaningful tests\n3) **Smells removed / anti-patterns corrected**\n   - Name at least 3 smells/anti-patterns you addressed over the term\n   - For each: link to the PR(s) and summarize the change in 2–4 sentences\n4) **Patterns applied intentionally**\n   - Name at least 3 patterns you applied (ex: Service Layer, Strategy, Value Object, Command Object)\n   - For each: link to a design note and PR(s)\n5) **Quality enforcement**\n   - Describe your CI required checks / quality gates\n   - Link to the workflow file(s) and a PR where they ran\n6) **How to run + troubleshoot**\n   - Commands to run app + tests\n   - Where logs are; common failure modes\n7) **Next steps (if you had 1 more month)**\n   - 3 prioritized improvements with rationale\n\n## Acceptance criteria\n- File exists at the exact path.\n- Contains all sections above.\n- Includes at least 8 links to PRs/issues across the semester.\n- Writing is concise and evidence-based.'
+
+          create_and_assign "[P4][M] CI required checks + one quality gate (enforced on PRs)" "P4,size/M,type/devops,type/tests,area/ops" $'## Goal\nMake quality enforceable via GitHub Actions required checks.\n\n## Required work\n1) Add a GitHub Actions workflow that runs on pull requests.\n2) Workflow must include:\n   - `unit-tests` job that runs `mvn test`\n   - `quality-gate` job that runs **exactly one** of:\n     - Spotless (formatting), OR\n     - Checkstyle (lint rules), OR\n     - SpotBugs (static bug-finding)\n3) Ensure the checks are visible on PRs.\n\n## Required verification\n- Open a PR and confirm both checks run.\n\n## Acceptance criteria\n- CI runs on PR.\n- Both jobs pass on main.\n- README includes the local command equivalents.'
+
+          create_and_assign "[P4][M] Reproducible environment: Docker Compose run (app + Postgres)" "P4,size/M,type/devops,area/ops,type/docs" $'## Goal\nMake local run reproducible with one command.\n\n## Required work\n1) Add `docker-compose.yml` that runs:\n   - Postgres\n   - the app\n2) Use environment variables (no secrets committed).\n3) Update README with:\n   - how to run: `docker compose up --build`\n   - expected URL(s)\n   - how to reset DB (volumes)\n\n## Required automated check\nAdd a workflow job named `compose-smoke` that:\n1) runs `docker compose up -d --build`\n2) waits for the app port\n3) curls `GET /login` expecting **200**\n4) runs `docker compose down -v`\n\n## Acceptance criteria\n- Compose works locally.\n- `compose-smoke` job passes in CI.'
+
+          create_and_assign "[P4][S] Troubleshooting runbook + operational checklist" "P4,size/S,type/docs,area/ops" $'## Goal\nShip the repo with basic “operations-ready” documentation.\n\n## Required work\n1) Add `TROUBLESHOOTING.md` with:\n   - common errors and fixes (DB connection, login, CSRF issues)\n   - how to reset the DB\n   - where logs are and what to look for\n2) Add `docs/OPERATIONAL-CHECKLIST.md` with a checklist that includes:\n   - run tests\n   - verify core flows manually\n   - verify CI is green\n   - verify no secrets committed\n\n## Acceptance criteria\n- Both files exist.\n- Content is concrete (commands + symptoms + fixes).\n- Links to relevant docs/commands in repo.'
 
           # =========================
-          # P3
+          # P3 (NARROWED: SPECIFICATIONS/FILTERING AS THE MAIN DRIVER)
           # =========================
-          create_and_assign "[P3][M] Add filters: date range + category + text search" "P3,size/M,type/feature,type/tests,area/ui,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern\n- **Conditional Query Explosion / Long Parameter List**\n\n## Pattern\n- **Specification Pattern** (Spring Data JPA Specifications)\n\n## Required work\n1) Implement filters using JPA Specifications.\n2) UI allows setting date range + category + text.\n\n## Required tests (Repository; JPA slice)\nCreate `TransactionSpecificationTest.java` with exactly:\n1) `filter_dateRangeAndCategory()`\n2) `filter_categoryAndText()`\n3) `filter_allCombined()`\n\n## Required design note\n- `docs/design-notes/P3-filter-specification.md`\n'
 
-          create_and_assign "[P3][M/L] Add a small REST API (read-only) for transactions + incomes" "P3,size/M,type/feature,type/tests,area/security,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern\n- **Expose Entities / Leaky Abstraction**\n\n## Pattern\n- **DTO + Mapper/Assembler**\n\n## Required work\n1) Implement endpoints:\n   - `GET /api/transactions`\n   - `GET /api/incomes`\n2) Must return ONLY logged-in user’s data.\n3) Do NOT serialize entities directly.\n\n## Required tests (Integration; H2 ok)\nCreate `ApiSecurityIntegrationTest.java` with:\n1) `anonymous_apiIsDenied()`\n2) `authenticated_onlyOwnDataReturned()`\n\n## Required design note\n- `docs/design-notes/P3-api-dto-boundary.md`\n'
+          create_and_assign "[P3][L] Introduce a shared base entity for Income and Transaction" "P2,size/L,type/refactor,type/tests,area/data" $'NOTE: This issue belongs in P2; if you keep it here, update labels/tags accordingly.'
+
+          create_and_assign "[P3][L] Implement monthly budgets per category" "P3,size/L,type/feature,type/tests,area/data" $'## Goal\nAllow users to set monthly budgets per category and see remaining/over-budget.\n\n## Required work\n1) Add `CategoryBudget(user, yearMonth, category, amount)`.\n2) UI to create/update budgets for a month.\n3) Dashboard must show spent vs budget and remaining/over-budget per category.\n\n## Required tests\nCreate:\n- `BudgetCalculationTest.java` (service unit)\n- `CategoryBudgetRepositoryTest.java` (JPA)\n\nMust implement:\n1) `underBudget_remainingCorrect()` (unit)\n2) `overBudget_excessCorrect()` (unit)\n3) `budgetPersistsForUserMonthCategory()` (JPA)\n\n## Acceptance criteria\n- Calculations correct.\n- Persistence works.\n- All 3 tests pass.'
+
+          create_and_assign "[P3][L] Recurring income/expense rules" "P3,size/L,type/feature,type/tests,area/data" $'## Goal\nSupport recurring rules and safe generation of future instances.\n\n## Required work\n1) Add recurrence rule entity (weekly/monthly).\n2) Generate instances up to a fixed horizon (e.g., next 3 months).\n3) Generation must be idempotent (no duplicates on rerun).\n4) Define and implement a month-end policy (e.g., Jan 31 -> Feb 28/29).\n\n## Required tests (service unit)\nCreate `RecurrenceGeneratorTest.java` with:\n1) `generatesExpectedInstancesWithinHorizon()`\n2) `rerunIsIdempotent_noDuplicates()`\n3) `monthEndRule_isCorrect()`\n\n## Acceptance criteria\n- No duplicates.\n- Month-end behavior correct.\n- All 3 tests pass.'
+
+          create_and_assign "[P3][L] CSV import with preview + validation report" "P3,size/L,type/feature,type/tests,area/data" $'## Goal\nImport transactions from CSV with a preview step and validation report.\n\n## Required work\n1) Upload CSV -> preview page showing parsed rows.\n2) Preview page must show per-row validation errors with row numbers.\n3) Only after explicit confirmation should records be persisted.\n\n## Required tests (integration)\nCreate `CsvImportIntegrationTest.java` with:\n1) `upload_showsPreviewWithParsedRows()`\n2) `preview_showsValidationErrorsForBadRows()`\n3) `confirm_persistsRecords_afterConfirmationOnly()`\n\n## Acceptance criteria\n- Preview step exists.\n- Validation report is clear.\n- Persist happens only after confirmation.\n- All 3 tests pass.'
+
+          create_and_assign "[P3][L] Split a transaction across multiple categories" "P3,size/L,type/feature,type/tests,area/data" $'## Goal\nAllow one transaction to be split into multiple category line items.\n\n## Required work\n1) Add a split/line-item model so each line has (category, amount).\n2) UI supports adding/removing split lines.\n3) Enforce invariant: sum(line amounts) == transaction total.\n4) Totals/charts must use split lines for category totals.\n\n## Required tests\nCreate:\n- `SplitTransactionServiceTest.java` (unit)\n- `SplitTransactionRepositoryTest.java` (JPA)\n\nMust implement:\n1) `rejectsWhenSplitSumDoesNotEqualTotal()` (unit)\n2) `persistsAndLoadsLineItems()` (JPA)\n3) `categoryTotalsUseSplitLines()` (unit)\n\n## Acceptance criteria\n- Invariant enforced.\n- Category totals reflect split lines.\n- All 3 tests pass.'
+
+          create_and_assign "[P3][M] Add \"notes\" field and display it everywhere relevant" "P3,size/M,type/feature,type/tests,area/ui" $'## Goal\nAdd a notes field and ensure it is persisted and rendered.\n\n## Required work\n1) Add `notes` field to Transaction.\n2) Show notes in list/detail/edit views.\n3) Include notes in CSV export.\n\n## Required tests\nCreate:\n- `TransactionRepositoryNotesTest.java` (JPA)\n- `NotesRenderingMvcTest.java` (MVC)\n\nMust implement:\n1) `notes_persistAndLoad()` (JPA)\n2) `notes_areRenderedInHtml()` (MVC)\n\n## Acceptance criteria\n- Notes persist.\n- Notes appear in HTML.\n- Both tests pass.'
+
+          create_and_assign "[P3][M] Add filters using Specifications (date range + category + text)" "P3,size/M,type/feature,type/tests,area/ui,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern (must name in your design note)\n- **Conditional Query Explosion / Long Parameter List** (many `if/else` paths and too many query methods)\n\n## Pattern (must name in your design note)\n- **Specification Pattern** (Spring Data JPA Specifications / Query Object)\n\n## Required work\n1) Implement filters for transactions:\n   - start date + end date\n   - category\n   - text contains (title or description)\n2) Implement filter composition using Specifications (not many repository methods).\n3) UI must allow setting all filters and preserving them on submit.\n\n## Required tests (JPA slice)\nCreate `TransactionSpecificationTest.java` with exactly these tests:\n1) `filter_dateRangeAndCategory()`\n2) `filter_categoryAndText()`\n3) `filter_allCombined()`\n\n## Required design note\n- `docs/design-notes/P3-filter-specification.md`\n\n## Acceptance criteria\n- Filters compose correctly.\n- Exactly 3 tests above pass.'
 
           # =========================
           # P2
           # =========================
-          create_and_assign "[P2][M] Introduce service layer for transactions/incomes (thin controllers)" "P2,size/M,type/refactor,type/tests,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern\n- **God Controller / Transaction Script**\n\n## Pattern\n- **Service Layer**\n\n## Required work\n1) Create `TransactionService` and `IncomeService`.\n2) Move ownership checks + user scoping into services.\n3) Controllers become orchestration only.\n\n## Required tests (Service unit)\nCreate:\n- `TransactionServiceTest.java`\n- `IncomeServiceTest.java`\n\nMust include:\n1) `deleteTransaction_wrongOwner_isRejected()`\n2) `listIncomes_scopedToUserOnly()`\n\n## Required design note\n- `docs/design-notes/P2-service-layer.md`\n'
 
-          create_and_assign "[P2][M] Replace “Month = now” with a PeriodStrategy" "P2,size/M,type/refactor,type/tests,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern\n- **Conditional Complexity**\n\n## Pattern\n- **Strategy Pattern** (`PeriodStrategy`)\n\n## Required work\n1) Implement `CurrentMonthStrategy`.\n2) Implement `SelectedMonthStrategy` from `?month=YYYY-MM`.\n\n## Required tests (Unit)\nCreate `PeriodStrategyTest.java` with:\n1) `currentMonth_rangeCorrect()`\n2) `selectedMonth_rangeCorrect_forYYYYMM()`\n\n## Required design note\n- `docs/design-notes/P2-period-strategy.md`\n'
+          create_and_assign "[P2][L] Replace double amounts with BigDecimal (money correctness)" "P2,size/L,type/refactor,type/tests,area/data,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern (must name in your design note)\n- **Primitive Obsession** (money as primitive) and floating-point rounding errors\n\n## Pattern (must name in your design note)\n- **Value Object** (Money)\n\n## Required work\n1) Replace money fields with BigDecimal.\n2) Introduce a Money value object (wrapper) that centralizes scale and rounding.\n3) Update totals, charts, and export to use Money.\n\n## Required tests (unit)\nCreate `MoneyValueObjectTest.java` with:\n1) `addsWithFixedScale()`\n2) `classicFloatingPointExample_isCorrect()`\n\nCreate `CashflowTotalsWithMoneyTest.java` with:\n3) `summaryTotals_useMoneyAndAreCorrect()`\n\n## Required design note\n- `docs/design-notes/P2-money-value-object.md`\n\n## Acceptance criteria\n- No doubles used for money.\n- All 3 tests pass.'
+
+          create_and_assign "[P2][M] Replace \"Month = now\" with a PeriodStrategy" "P2,size/M,type/refactor,type/tests,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern (must name in your design note)\n- **Conditional Complexity** (period logic scattered as if/else)\n\n## Pattern (must name in your design note)\n- **Strategy Pattern** (`PeriodStrategy`)\n\n## Required work\n1) Create `PeriodStrategy` returning a date range.\n2) Implement:\n   - `CurrentMonthStrategy`\n   - `SelectedMonthStrategy` (from `?month=YYYY-MM`)\n3) Update summary code to use strategy output.\n\n## Required tests (unit)\nCreate `PeriodStrategyTest.java` with:\n1) `currentMonth_rangeCorrect()`\n2) `selectedMonth_rangeCorrect_forYYYYMM()`\n\n## Required design note\n- `docs/design-notes/P2-period-strategy.md`\n\n## Acceptance criteria\n- Period selection is strategy-based.\n- Both tests pass.'
+
+          create_and_assign "[P2][M] Deduplicate monthly summary calculations (home + dashboard)" "P2,size/M,type/refactor,type/tests,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern (must name in your design note)\n- **Duplicate Code / Shotgun Surgery** (same totals computed in multiple places)\n\n## Pattern (must name in your design note)\n- **Facade** (`CashflowSummaryService`) returning a summary Value Object\n\n## Required work\n1) Create `CashflowSummaryService` as the single entry point to compute totals.\n2) Create a summary value object (e.g., `MonthlyCashflowSummary`).\n3) Update both home + dashboard to use the facade.\n\n## Required tests (service unit)\nCreate `CashflowSummaryServiceTest.java` with:\n1) `emptyData_totalsAreZero()`\n2) `mixedData_totalsCorrect()`\n3) `ignoresRecordsOutsideSelectedMonth()`\n\n## Required design note\n- `docs/design-notes/P2-summary-facade.md`\n\n## Acceptance criteria\n- Duplicate computations removed.\n- All 3 tests pass.'
+
+          create_and_assign "[P2][M] Introduce service layer for transactions/incomes (thin controllers)" "P2,size/M,type/refactor,type/tests,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern (must name in your design note)\n- **God Controller / Transaction Script**\n\n## Pattern (must name in your design note)\n- **Service Layer** (explicit boundary)\n\n## Required work\n1) Create `TransactionService` and `IncomeService`.\n2) Move ownership checks + user scoping into services.\n3) Controllers become orchestration only.\n\n## Required tests (service unit)\nCreate:\n- `TransactionServiceTest.java`\n- `IncomeServiceTest.java`\n\nMust implement:\n1) `createTransaction_happyPath_saves()`\n2) `deleteTransaction_wrongOwner_isRejected()`\n3) `listIncomes_scopedToUserOnly()`\n\n## Required design note\n- `docs/design-notes/P2-service-layer.md`\n\n## Acceptance criteria\n- Controllers are thin.\n- Services enforce ownership.\n- All 3 tests pass.'
+
+          create_and_assign "[P2][M] Add @ControllerAdvice for consistent error handling" "P2,size/M,type/refactor,type/tests" $'## Goal\nCentralize error handling for consistent, friendly responses.\n\n## Required work\n1) Add `@ControllerAdvice` that handles:\n   - not found\n   - generic exception\n2) Return a friendly error page without stack traces.\n\n## Required tests (MVC)\nCreate `GlobalErrorHandlerMvcTest.java` with:\n1) `notFound_returnsFriendlyErrorView()`\n2) `unhandledException_returnsFriendlyErrorView()`\n\n## Acceptance criteria\n- Errors are consistent.\n- Both tests pass.'
+
+          create_and_assign "[P2][M] Enforce unique usernames + improve registration validation" "P2,size/M,type/feature,type/tests,area/security" $'## Goal\nPrevent duplicate usernames and show a friendly error.\n\n## Required work\n1) Add a DB uniqueness constraint to username.\n2) Update registration flow so duplicates show an in-form error.\n\n## Required tests\nCreate `UserRepositoryUniqueUsernameTest.java` (JPA) with:\n1) `username_isUniqueConstraint()`\n\nCreate `RegistrationDuplicateUsernameMvcTest.java` (MVC) with:\n2) `duplicateUsername_showsErrorAndDoesNotRedirect()`\n\n## Acceptance criteria\n- Constraint enforced.\n- UI error shown.\n- Both tests pass.'
+
+          create_and_assign "[P2][S] Make DataSeeder run only in dev profile" "P2,size/S,type/refactor,type/tests" $'## Goal\nEnsure DataSeeder does not run in tests or normal runs.\n\n## Required work\n1) Add `@Profile(\"dev\")` (or equivalent) to DataSeeder.\n2) Ensure seeding is disabled by default.\n\n## Required tests (integration)\nCreate `SeederProfileIntegrationTest.java` with:\n1) `defaultProfile_dataSeederBeanIsAbsent()`\n2) `devProfile_dataSeederBeanIsPresent()`\n\n## Acceptance criteria\n- Seeder is dev-only.\n- Both tests pass.'
+
+          create_and_assign "[P2][L] Introduce a shared base entity for Income and Transaction" "P2,size/L,type/refactor,type/tests,area/data" $'## Goal\nReduce duplicated entity mapping while keeping persistence correct.\n\n## Required work\n1) Introduce a `@MappedSuperclass` for shared fields.\n2) Refactor Income and Transaction to inherit.\n\n## Required tests (JPA slice)\nCreate:\n- `TransactionMappingJpaTest.java`\n- `IncomeMappingJpaTest.java`\n\nMust implement:\n1) `transaction_persistFlushClearReload_roundTripsFields()`\n2) `income_persistFlushClearReload_roundTripsFields()`\n\n## Acceptance criteria\n- Mapping works after refactor.\n- Both tests pass.'
 
           # =========================
           # P1
           # =========================
-          create_and_assign "[P1][M] Add first meaningful tests for TransactionController#home" "P1,size/M,type/tests" $'## Goal\nCreate the first reliable MVC tests for core home behavior.\n\n## Required tests (MVC)\nCreate `TransactionControllerMvcTest.java` with exactly these tests:\n1) `anonymousUser_getHome_returnsLanding()`\n2) `authenticatedUser_getHome_returnsHomeAndModelKeys()`\n\n## Acceptance criteria\n- Tests use `@WebMvcTest(TransactionController.class)` + `MockMvc`.\n- Both tests pass in CI.\n'
 
-          create_and_assign "[P1][S] Fix `/dashboard` route (missing view)" "P1,size/S,type/bug,type/tests,area/ui" $'## Goal\nMake `/dashboard` a real, working page.\n\n## Required work\n1) Create `templates/dashboard.html`.\n2) Must render and display model values:\n   - `monthlyTotal`\n   - `totalEarnings`\n   - `netCashflow`\n3) Heading contains exact text: `Dashboard`.\n\n## Required tests (MVC)\nCreate `DashboardMvcTest.java` with:\n1) `authenticated_getDashboard_returnsDashboardView()`\n2) `authenticated_getDashboard_includesRequiredModelAttributes()`\n'
+          create_and_assign "[P1][S] Add \"empty state\" UI for new users" "P1,size/S,type/feature,type/tests,area/ui" $'## Goal\nImprove UX when the user has no incomes/transactions.\n\n## Required work\n1) Update `home.html` so when there are 0 transactions and 0 incomes:\n   - show a visible empty-state section containing the exact text: `Add your first transaction`\n   - show a visible empty-state section containing the exact text: `Add your first income`\n2) Ensure totals and charts do not throw errors on empty datasets.\n\n## Required tests (MVC)\nCreate `HomeEmptyStateMvcTest.java` with:\n1) `authenticated_noData_rendersHome()`\n2) `authenticated_noData_containsEmptyStateMarkers()`\n\n## Acceptance criteria\n- Empty state text appears exactly as specified.\n- Both tests pass.'
+
+          create_and_assign "[P1][S] Sort transactions and incomes by date (newest first)" "P1,size/S,type/refactor,type/tests,area/ui" $'## Goal\nEnsure lists are newest-first and the controller uses repository methods that encode ordering.\n\n## Required work\n1) Add repository methods:\n   - `TransactionRepository.findByUserIdOrderByDateDesc(Long userId)`\n   - `IncomeRepository.findByUserIdOrderByDateDesc(Long userId)`\n2) Update controller to call those methods.\n\n## Required tests (MVC)\nCreate `SortedListsMvcTest.java` with exactly these tests:\n1) `home_usesOrderedRepositories()`\n2) `home_modelListsAreInExpectedOrder()`\n\n## Acceptance criteria\n- Ordered methods are used.\n- Both tests pass.'
+
+          create_and_assign "[P1][S] Make static assets accessible on landing/login pages" "P1,size/S,type/bug,type/tests,area/security" $'## Goal\nFix security config so public pages can load the real CSS path used by this repo.\n\n## Required work\n1) Allow anonymous access to `/style.css`.\n2) Do not weaken protection of authenticated routes.\n\n## Required tests (MVC)\nCreate `StaticAssetsSecurityMvcTest.java` with exactly these tests:\n1) `anonymous_canGetStyleCss()`\n2) `anonymous_canViewLoginPage()`\n\n## Acceptance criteria\n- `/style.css` loads anonymously.\n- Both tests pass.'
+
+          create_and_assign "[P1][S] Fix \"/dashboard\" route (missing view)" "P1,size/S,type/bug,type/tests,area/ui" $'## Goal\nMake `/dashboard` a real, working page.\n\n## Required work\n1) Create `src/main/resources/templates/dashboard.html`.\n2) Page must display:\n   - `monthlyTotal`\n   - `totalEarnings`\n   - `netCashflow`\n3) Add heading text: `Dashboard`.\n\n## Required tests (MVC)\nCreate `DashboardMvcTest.java` with exactly these tests:\n1) `authenticated_getDashboard_returnsDashboardView()`\n2) `authenticated_getDashboard_includesRequiredModelAttributes()`\n\n## Acceptance criteria\n- Template exists and renders.\n- Both tests pass.'
+
+          create_and_assign "[P1][M] Improve CSV export: consistent quoting + file name includes date" "P1,size/M,type/feature,type/tests,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern\n- **Ad-hoc String Building** (fragile CSV formatting scattered in controller)\n\n## Pattern\n- **Strategy Pattern** for cell escaping/quoting rules\n\n## Required work\n1) Extract CSV escaping/quoting into a `CsvEscaper` strategy.\n2) Handle commas, quotes, and newlines correctly.\n3) Set `Content-Disposition` filename to `transactions-YYYY-MM.csv`.\n\n## Required tests (MVC)\nCreate `CsvExportMvcTest.java` with exactly these tests:\n1) `export_escapesCommasQuotesNewlines()`\n2) `export_setsFilenameWithYearMonth()`\n\n## Required design note\n- `docs/design-notes/P1-csv-export.md`\n\n## Acceptance criteria\n- Escaping is correct.\n- Filename includes year-month.\n- Both tests pass.'
+
+          create_and_assign "[P1][M] Fix/clarify CSRF behavior for AJAX delete endpoints" "P1,size/M,type/bug,area/security,type/tests,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern\n- **\"Just disable CSRF\"** security anti-pattern\n\n## Pattern\n- **Synchronizer Token Pattern** (Spring Security CSRF token)\n\n## Required work\n1) Ensure AJAX delete endpoints work with CSRF enabled:\n   - `POST /transaction/delete/{id}`\n   - `POST /income/delete/{id}`\n2) Implement CSRF token propagation in UI and include token in AJAX request.\n\n## Required tests (MVC)\nCreate `CsrfDeleteMvcTest.java` with exactly these tests:\n1) `deleteTransaction_withoutCsrf_isForbidden()`\n2) `deleteTransaction_withCsrf_isOk_andDeletes()`\n\n## Required design note\n- `docs/design-notes/P1-csrf.md`\n\n## Acceptance criteria\n- CSRF remains enabled.\n- Both tests pass.'
+
+          create_and_assign "[P1][M] Add bean validation to Transaction and Income + show errors in UI" "P1,size/M,type/feature,type/tests,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern\n- **Missing Validation / Invariants Not Enforced**\n\n## Pattern\n- **Command Object** (Form/DTO separate from entity)\n\n## Required work\n1) Create form objects (e.g., `TransactionForm`, `IncomeForm`) with Bean Validation.\n2) Update controllers to use `@Valid` + `BindingResult`.\n3) On validation failure: return same view (200), show field errors, preserve input.\n\n## Required tests (MVC)\nCreate `ValidationMvcTest.java` with exactly these tests:\n1) `invalidTransaction_showsFieldErrors_andDoesNotSave()`\n2) `validTransaction_redirects_andSaves()`\n\n## Required design note\n- `docs/design-notes/P1-validation.md`\n\n## Acceptance criteria\n- Validation enforced.\n- Both tests pass.'
+
+          create_and_assign "[P1][M] Add first meaningful tests for TransactionController#home" "P1,size/M,type/tests" $'## Goal\nCreate the first reliable MVC tests for core home behavior.\n\n## Required tests (MVC)\nCreate `TransactionControllerMvcTest.java` with exactly these tests:\n1) `anonymousUser_getHome_returnsLanding()`\n2) `authenticatedUser_getHome_returnsHomeAndModelKeys()`\n\n## Acceptance criteria\n- Both tests pass in CI.\n- Uses `@WebMvcTest(TransactionController.class)` + `MockMvc`.'
 
           echo "Assigning milestones to ALL issues by [P#] prefix..." >&2
           assign_all_existing_issues_to_milestones
